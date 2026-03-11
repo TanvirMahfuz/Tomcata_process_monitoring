@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tomcat Processes Visualizer</title>
+  <style>
+    body { font-family: Inter, Roboto, Arial, sans-serif; margin: 16px; color: #111; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    h1 { font-size: 18px; margin:0 }
+    .controls { margin-top:8px; display:flex; gap:8px; align-items:center }
+    .summary { margin-top: 16px; display:flex; gap: 24px; flex-wrap:wrap }
+    .card { background:#f7f8fb; padding:12px; border-radius:8px; box-shadow:0 1px 0 rgba(0,0,0,0.04); min-width:180px }
+    #chartWrap { max-width:720px; margin-top: 16px }
+    table { width:100%; border-collapse:collapse; margin-top:16px }
+    th, td { padding:8px; border-bottom:1px solid #eee; text-align:left; vertical-align:top }
+    th { background:#fafafa; font-weight:600 }
+    .expand { cursor:pointer; color:#0b5fff; text-decoration:underline }
+    .thread-list { background:#fff; padding:8px; border-radius:6px; margin-top:6px; border:1px solid #eee }
+    pre { background:#0f1720; color:#e6eef8; padding:12px; overflow:auto; max-height:320px }
+    .muted { color:#666; font-size:13px }
+    .small { font-size:13px }
+    input[type=text] { padding:6px 8px; border:1px solid #ccc; border-radius:6px }
+    button { padding:6px 10px; border-radius:6px; border:1px solid #ccc; background:#fff; cursor:pointer }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Tomcat Processes Visualizer</h1>
+      <div class="muted">Loads <code>tomcat_processes.json</code> and shows embedded jstack data.</div>
+    </div>
+    <div class="controls">
+      <label class="small">Filter: <input id="filterInput" type="text" placeholder="PID or command substring" /></label>
+      <button id="reloadBtn">Reload JSON</button>
+      <div class="small muted">Serve via a local HTTP server (see instructions below).</div>
+    </div>
+  </header>
+
+  <section class="summary" id="summary">
+    <div class="card"><strong id="procCount">—</strong><div class="muted">Matched processes</div></div>
+    <div class="card"><strong id="totalThreads">—</strong><div class="muted">Total threads</div></div>
+    <div class="card"><strong id="avgThreads">—</strong><div class="muted">Avg threads / process</div></div>
+  </section>
+
+  <section id="chartWrap">
+    <canvas id="stateChart" width="720" height="240"></canvas>
+  </section>
+
+  <section>
+    <table id="procTable">
+      <thead>
+        <tr><th>PID</th><th>UID</th><th>Command</th><th>jstack</th><th>Threads</th><th>Details</th></tr>
+      </thead>
+      <tbody id="procTbody"></tbody>
+    </table>
+  </section>
+
+  <section style="margin-top:16px; color:#444; font-size:13px">
+    <p><strong>How to open</strong>: run a tiny local server from the project directory and open this page in a browser:</p>
+    <pre class="small">python3 -m http.server 8000
+# then open http://localhost:8000/visualization.html</pre>
+    <p class="muted">The page fetches <code>tomcat_processes.json</code> from the same directory. If the file is large it may take a moment to parse.</p>
+  </section>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script>
+    const jsonPath = 'tomcat_processes.json';
+    const filterInput = document.getElementById('filterInput');
+    const reloadBtn = document.getElementById('reloadBtn');
+    let rawData = [];
+    let chart = null;
+
+    reloadBtn.addEventListener('click', () => loadAndRender());
+    filterInput.addEventListener('input', () => renderTable(rawData));
+
+    function normalizeState(s) {
+      if (!s) return 'UNKNOWN';
+      const u = s.toUpperCase();
+      if (u.includes('RUNNABLE')) return 'RUNNABLE';
+      if (u.includes('TIMED_WAITING')) return 'TIMED_WAITING';
+      if (u.includes('WAITING')) return 'WAITING';
+      if (u.includes('BLOCKED')) return 'BLOCKED';
+      return 'OTHER';
+    }
+
+    async function loadAndRender() {
+      try {
+        const resp = await fetch(jsonPath + '?_=' + Date.now());
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        rawData = Array.isArray(data)? data : [];
+        renderSummary(rawData);
+        renderChart(rawData);
+        renderTable(rawData);
+      } catch (err) {
+        alert('Failed to load '+jsonPath+': ' + err);
+      }
+    }
+
+    function renderSummary(data) {
+      const procCount = data.length;
+      let totalThreads = 0;
+      data.forEach(p => { totalThreads += (p.jstack && Array.isArray(p.jstack.threads))? p.jstack.threads.length : 0 });
+      document.getElementById('procCount').textContent = procCount;
+      document.getElementById('totalThreads').textContent = totalThreads;
+      document.getElementById('avgThreads').textContent = procCount? (Math.round((totalThreads/procCount)*10)/10) : '—';
+    }
+
+    function renderChart(data) {
+      const counts = { RUNNABLE:0, WAITING:0, TIMED_WAITING:0, BLOCKED:0, OTHER:0, UNKNOWN:0 };
+      data.forEach(p => {
+        const threads = (p.jstack && Array.isArray(p.jstack.threads))? p.jstack.threads : [];
+        threads.forEach(t => { counts[normalizeState(t.state)] = (counts[normalizeState(t.state)]||0) + 1; });
+      });
+
+      const labels = Object.keys(counts);
+      const vals = labels.map(l => counts[l]);
+
+      const ctx = document.getElementById('stateChart').getContext('2d');
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{ label: 'Threads by state', data: vals, backgroundColor: ['#16a34a','#f59e0b','#0ea5e9','#ef4444','#6b7280','#94a3b8'] }]
+        },
+        options: { responsive:true, maintainAspectRatio:false }
+      });
+    }
+
+    function renderTable(data) {
+      const tbody = document.getElementById('procTbody');
+      tbody.innerHTML = '';
+      const q = (filterInput.value||'').toLowerCase().trim();
+
+      data.forEach(proc => {
+        const pid = proc.PID || '';
+        const uid = proc.UID || '';
+        const cmd = (proc.CMD||'').replace(/\s+/g,' ');
+        const jsaved = !!proc.jstack_saved;
+        const threads = (proc.jstack && Array.isArray(proc.jstack.threads))? proc.jstack.threads : [];
+        const tcount = threads.length;
+
+        if (q) {
+          if (!(pid.includes(q) || uid.toLowerCase().includes(q) || cmd.toLowerCase().includes(q))) return;
+        }
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><strong>${escapeHtml(pid)}</strong></td>
+                        <td>${escapeHtml(uid)}</td>
+                        <td class="small">${escapeHtml(cmd)}</td>
+                        <td>${jsaved? 'embedded' : (proc.jstack_info? escapeHtml(proc.jstack_info) : 'no')}</td>
+                        <td>${tcount}</td>
+                        <td><span class="expand">Show</span></td>`;
+
+        const expandCell = tr.querySelector('.expand');
+        expandCell.addEventListener('click', () => toggleDetails(proc, tr));
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    function toggleDetails(proc, row) {
+      // if next sibling is details, remove
+      const next = row.nextElementSibling;
+      if (next && next.classList && next.classList.contains('details-row')) { next.remove(); return; }
+
+      const detailsRow = document.createElement('tr');
+      detailsRow.classList.add('details-row');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+
+      const container = document.createElement('div');
+      container.className = 'thread-list';
+
+      const header = document.createElement('div');
+      header.innerHTML = `<strong>PID ${escapeHtml(proc.PID||'')}</strong> &nbsp; <span class="muted">${escapeHtml(proc.CMD || '')}</span>`;
+      container.appendChild(header);
+
+      if (!proc.jstack_saved) {
+        const info = document.createElement('div');
+        info.className = 'muted';
+        info.textContent = 'No jstack embedded: ' + (proc.jstack_info || 'skipped/failed');
+        container.appendChild(info);
+      } else {
+        const threads = proc.jstack.threads || [];
+        const list = document.createElement('div');
+        list.style.marginTop = '8px';
+        threads.forEach((t, idx) => {
+          const entry = document.createElement('div');
+          entry.style.padding = '6px 0';
+          entry.innerHTML = `<div><strong>${escapeHtml(t.name|| ('#'+(idx+1)))}</strong>
+                              <span class="muted"> &nbsp; ${escapeHtml(t.state||'')}</span></div>
+                             <div class="small muted">${escapeHtml(t.stack && t.stack[0] ? t.stack[0] : '')}</div>`;
+
+          const showStack = document.createElement('button');
+          showStack.textContent = 'Full stack';
+          showStack.style.marginTop = '6px';
+          showStack.addEventListener('click', () => {
+            const existing = entry.querySelector('pre');
+            if (existing) { existing.remove(); return; }
+            const pre = document.createElement('pre');
+            pre.textContent = (t.stack && t.stack.length)? t.stack.join('\n') : (proc.jstack.raw || '');
+            entry.appendChild(pre);
+          });
+
+          entry.appendChild(showStack);
+          list.appendChild(entry);
+        });
+        container.appendChild(list);
+      }
+
+      // raw dump link
+      if (proc.jstack && proc.jstack.raw) {
+        const rawBtn = document.createElement('button');
+        rawBtn.textContent = 'Show full raw dump';
+        rawBtn.style.marginLeft = '8px';
+        rawBtn.addEventListener('click', () => {
+          const existing = container.querySelector('pre.global-raw');
+          if (existing) { existing.remove(); return; }
+          const pre = document.createElement('pre');
+          pre.className = 'global-raw';
+          pre.textContent = proc.jstack.raw;
+          container.appendChild(pre);
+        });
+        container.appendChild(rawBtn);
+      }
+
+      td.appendChild(container);
+      detailsRow.appendChild(td);
+      row.parentNode.insertBefore(detailsRow, row.nextSibling);
+      window.scrollTo({ top: row.offsetTop - 16, behavior: 'smooth' });
+    }
+
+    // tiny html escaper
+    function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"})[c]); }
+
+    // initial load
+    loadAndRender();
+  </script>
+</body>
+</html>
